@@ -84,6 +84,15 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) >= 2 and parts[0] == "api" and parts[1] == "evacuation-plans":
+                    if len(parts) == 3:
+                        return self._send(200, service.get(parts[2]))
+                    query = parse_qs(parsed.query)
+                    incident_id = query.get("incident_id", [None])[0]
+                    plans = service.list("evacuation_plan")
+                    if incident_id:
+                        plans = [p for p in plans if p["data"].get("incident_id") == incident_id]
+                    return self._send(200, {"items": plans})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -129,6 +138,9 @@ def create_handler(service, rules, static_dir):
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     return self._send(200, service.transition(actor, parts[2], parts[3], self._body(), None))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "incidents" and parts[3] == "plans":
+                    body = self._body()
+                    return self._send(201, service.submit_evacuation_plan(actor, parts[2], body.get("expected_version")))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

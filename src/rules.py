@@ -95,8 +95,9 @@ def _complete_task(actor, entity, data, lookup):
 
 
 def _close_incident(actor, entity, data, lookup):
-    if [w for w in _all(lookup, "worker") if w["status"] in ("missing", "located")]:
-        raise ConflictError("cannot close incident while workers are missing or located")
+    blocking = [w for w in _all(lookup, "worker") if w["status"] in ("missing", "located", "active")]
+    if blocking:
+        raise ConflictError("cannot close incident while workers are missing, located, or not yet in place")
     active_tasks = [t for t in _all(lookup, "task") if t["status"] not in ("completed", "cancelled")]
     if active_tasks:
         raise ConflictError("cannot close incident while tasks remain active")
@@ -110,19 +111,22 @@ class RuleEngine:
         "workers": "worker", "sensors": "sensor", "ventilations": "ventilation",
         "passages": "passage", "refuges": "refuge", "incidents": "incident",
         "tasks": "task", "offline-records": "offline_record", "offline_records": "offline_record",
+        "evacuation-plans": "evacuation_plan", "evacuation_plans": "evacuation_plan",
     }
     INITIAL_STATUS = {
         "worker": "active", "sensor": "normal", "ventilation": "running",
         "passage": "open", "refuge": "available", "incident": "detected",
-        "task": "proposed", "offline_record": "merged",
+        "task": "proposed", "offline_record": "merged", "evacuation_plan": "active",
     }
     TRANSITIONS = {
         "worker": {
             "mark_missing": (("active",), "missing"),
             "locate": (("missing",), "located"),
             "evacuate": (("missing", "located"), "evacuated"),
-            "rescue": (("missing", "located"), "rescued"),
+            "rescue": (("missing", "located", "pending_rescue"), "rescued"),
             "find_safe": (("missing",), "active"),
+            "take_shelter": (("active",), "evacuated"),
+            "mark_pending_rescue": (("active", "evacuated"), "pending_rescue"),
             "deactivate": (("active",), "inactive"),
         },
         "sensor": {
@@ -172,6 +176,7 @@ class RuleEngine:
         "incident": ("area_code", "severity", "summary"),
         "task": ("incident_id", "task_type", "target", "dedupe_key"),
         "offline_record": ("source_id", "record_id", "recorded_at", "payload"),
+        "evacuation_plan": ("incident_id",),
     }
     ACTION_REQUIRED = {
         ("worker", "rescue"): ("incident_id",),
@@ -198,6 +203,8 @@ class RuleEngine:
         "evacuate": ("admin", "field", "dispatcher"),
         "rescue": ("admin", "field", "safety"),
         "find_safe": ("admin", "field", "safety"),
+        "take_shelter": ("admin", "field", "dispatcher"),
+        "mark_pending_rescue": ("admin", "dispatcher", "safety"),
         "deactivate": ("admin", "safety"),
         "raise_warning": ("admin", "field", "safety"),
         "raise_alarm": ("admin", "field", "safety"),
