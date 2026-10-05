@@ -1,3 +1,4 @@
+from collections import deque
 from datetime import datetime, timedelta
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
@@ -95,8 +96,11 @@ def _complete_task(actor, entity, data, lookup):
 
 
 def _close_incident(actor, entity, data, lookup):
-    if [w for w in _all(lookup, "worker") if w["status"] in ("missing", "located")]:
+    workers = _all(lookup, "worker")
+    if [w for w in workers if w["status"] in ("missing", "located")]:
         raise ConflictError("cannot close incident while workers are missing or located")
+    if [w for w in workers if w["status"] == "active"]:
+        raise ConflictError("cannot close incident while on-duty workers are neither sheltered nor awaiting rescue")
     active_tasks = [t for t in _all(lookup, "task") if t["status"] not in ("completed", "cancelled")]
     if active_tasks:
         raise ConflictError("cannot close incident while tasks remain active")
@@ -105,24 +109,160 @@ def _close_incident(actor, entity, data, lookup):
     return {"closed_by": actor.user_id}
 
 
+def _build_passage_graph(passages):
+    """Adjacency of locations linked by currently open passages (undirected)."""
+    graph = {}
+    for passage in passages:
+        if passage["status"] != "open":
+            continue
+        frm = passage["data"].get("from_location")
+        to = passage["data"].get("to_location")
+        graph.setdefault(frm, []).append((to, passage["id"]))
+        graph.setdefault(to, []).append((frm, passage["id"]))
+    return graph
+
+
+def _bfs_route(graph, start, target_by_location):
+    """Shortest path from start to any target location; returns (passage_ids, refuge_id)."""
+    if start in target_by_location:
+        return [], target_by_location[start]
+    visited = {start}
+    queue = deque([(start, [])])
+    while queue:
+        location, path = queue.popleft()
+        for neighbor, passage_id in graph.get(location, []):
+            if neighbor in visited:
+                continue
+            visited.add(neighbor)
+            next_path = path + [passage_id]
+            if neighbor in target_by_location:
+                return next_path, target_by_location[neighbor]
+            queue.append((neighbor, next_path))
+    return None, None
+
+
+def _refuge_occupancy(lookup, exclude_plan_id=None):
+    """Occupied refuge slots from planned/arrived assignments of active plans."""
+    occupancy = {}
+    for plan in _all(lookup, "evacuation_plan"):
+        if plan["status"] != "active" or plan["id"] == exclude_plan_id:
+            continue
+        for assignment in plan["data"].get("assignments", []):
+            refuge_id = assignment.get("refuge_id")
+            if refuge_id and assignment.get("status") in ("planned", "arrived"):
+                occupancy[refuge_id] = occupancy.get(refuge_id, 0) + 1
+    return occupancy
+
+
+def compute_routes(lookup, workers, base_occupancy=None):
+    """Route each worker to the nearest refuge with spare capacity.
+
+    Workers that would exceed a refuge's rated capacity are refused
+    (status unassigned); workers with no physical route are unreachable.
+    """
+    graph = _build_passage_graph(_all(lookup, "passage"))
+    refuges = [r for r in _all(lookup, "refuge") if r["status"] != "maintenance"]
+    occupancy = dict(base_occupancy or {})
+    assignments = []
+    for worker in workers:
+        start = worker["data"].get("location_code")
+        with_capacity = {}
+        for refuge in refuges:
+            capacity = _number(refuge["data"].get("capacity"), "capacity")
+            location = refuge["data"].get("location_code")
+            if occupancy.get(refuge["id"], 0) < capacity and location not in with_capacity:
+                with_capacity[location] = refuge["id"]
+        path, refuge_id = _bfs_route(graph, start, with_capacity)
+        if refuge_id:
+            occupancy[refuge_id] = occupancy.get(refuge_id, 0) + 1
+            assignments.append({
+                "worker_id": worker["id"],
+                "refuge_id": refuge_id,
+                "passage_ids": path,
+                "status": "planned",
+            })
+            continue
+        any_refuge = {}
+        for refuge in refuges:
+            any_refuge.setdefault(refuge["data"].get("location_code"), refuge["id"])
+        _, reachable_id = _bfs_route(graph, start, any_refuge)
+        if reachable_id:
+            assignments.append({
+                "worker_id": worker["id"],
+                "refuge_id": None,
+                "passage_ids": [],
+                "status": "unassigned",
+                "reason": "refuge_capacity_exceeded",
+            })
+        else:
+            assignments.append({
+                "worker_id": worker["id"],
+                "refuge_id": None,
+                "passage_ids": [],
+                "status": "unreachable",
+                "reason": "no_route",
+            })
+    return assignments
+
+
+def _validate_evacuation_plan(data, lookup):
+    incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
+    if not incident or incident["status"] == "closed":
+        raise ValidationError("evacuation plan requires an open incident")
+    if not [s for s in _all(lookup, "sensor") if s["status"] == "alarm"]:
+        raise ValidationError("evacuation plan requires an active gas alarm")
+    for plan in _all(lookup, "evacuation_plan"):
+        if plan["data"].get("incident_id") == data.get("incident_id") and plan["status"] in ("draft", "active"):
+            raise ConflictError("an evacuation plan already exists for incident: " + str(data.get("incident_id")))
+
+
+def _submit_evacuation_plan(actor, entity, data, lookup):
+    workers = [w for w in _all(lookup, "worker") if w["status"] == "active"]
+    occupancy = _refuge_occupancy(lookup, exclude_plan_id=entity["id"])
+    assignments = compute_routes(lookup, workers, occupancy)
+    return {"assignments": assignments, "planned_by": actor.user_id}
+
+
+def _worker_shelter(actor, entity, data, lookup):
+    refuge_id = data.get("refuge_id")
+    if not _find_one(lookup, "refuge", "id", refuge_id):
+        raise ValidationError("unknown refuge: " + str(refuge_id))
+    for plan in _all(lookup, "evacuation_plan"):
+        if plan["status"] != "active":
+            continue
+        for assignment in plan["data"].get("assignments", []):
+            if (
+                assignment.get("worker_id") == entity["id"]
+                and assignment.get("status") == "planned"
+                and assignment.get("refuge_id") == refuge_id
+            ):
+                return {"sheltered_refuge_id": refuge_id, "plan_id": plan["id"]}
+    raise ValidationError("no planned evacuation assignment for this worker at refuge: " + str(refuge_id))
+
+
 class RuleEngine:
     ALIASES = {
         "workers": "worker", "sensors": "sensor", "ventilations": "ventilation",
         "passages": "passage", "refuges": "refuge", "incidents": "incident",
         "tasks": "task", "offline-records": "offline_record", "offline_records": "offline_record",
+        "evacuation-plans": "evacuation_plan", "evacuation_plans": "evacuation_plan",
+        "plans": "evacuation_plan",
     }
     INITIAL_STATUS = {
         "worker": "active", "sensor": "normal", "ventilation": "running",
         "passage": "open", "refuge": "available", "incident": "detected",
-        "task": "proposed", "offline_record": "merged",
+        "task": "proposed", "offline_record": "merged", "evacuation_plan": "draft",
     }
     TRANSITIONS = {
         "worker": {
             "mark_missing": (("active",), "missing"),
             "locate": (("missing",), "located"),
             "evacuate": (("missing", "located"), "evacuated"),
-            "rescue": (("missing", "located"), "rescued"),
+            "rescue": (("missing", "located", "awaiting_rescue"), "rescued"),
             "find_safe": (("missing",), "active"),
+            "shelter": (("active",), "sheltered"),
+            "mark_awaiting_rescue": (("active",), "awaiting_rescue"),
+            "reroute": (("awaiting_rescue",), "active"),
             "deactivate": (("active",), "inactive"),
         },
         "sensor": {
@@ -162,6 +302,10 @@ class RuleEngine:
             "complete": (("in_progress",), "completed"),
             "cancel": (("proposed", "assigned", "in_progress"), "cancelled"),
         },
+        "evacuation_plan": {
+            "submit": (("draft",), "active"),
+            "cancel": (("draft", "active"), "cancelled"),
+        },
     }
     CREATE_REQUIRED = {
         "worker": ("name", "location_code", "team"),
@@ -172,9 +316,11 @@ class RuleEngine:
         "incident": ("area_code", "severity", "summary"),
         "task": ("incident_id", "task_type", "target", "dedupe_key"),
         "offline_record": ("source_id", "record_id", "recorded_at", "payload"),
+        "evacuation_plan": ("incident_id",),
     }
     ACTION_REQUIRED = {
         ("worker", "rescue"): ("incident_id",),
+        ("worker", "shelter"): ("refuge_id",),
         ("sensor", "mark_faulty"): ("reason",),
         ("ventilation", "restore"): ("tested_at",),
         ("ventilation", "degrade"): ("reason",),
@@ -191,6 +337,7 @@ class RuleEngine:
         "incident": ("admin", "safety", "dispatcher"),
         "task": ("admin", "dispatcher", "safety"),
         "offline_record": ("admin", "safety", "dispatcher", "field"),
+        "evacuation_plan": ("admin", "safety", "dispatcher"),
     }
     ROLE_ACTIONS = {
         "mark_missing": ("admin", "safety", "dispatcher"),
@@ -223,6 +370,11 @@ class RuleEngine:
         "accept": ("admin", "field", "dispatcher"),
         "complete": ("admin", "field", "dispatcher"),
         "cancel": ("admin", "dispatcher", "safety"),
+        ("worker", "shelter"): ("admin", "field", "safety", "dispatcher"),
+        ("worker", "mark_awaiting_rescue"): ("admin", "safety", "dispatcher"),
+        ("worker", "reroute"): ("admin", "safety", "dispatcher"),
+        ("evacuation_plan", "submit"): ("admin", "safety", "dispatcher"),
+        ("evacuation_plan", "cancel"): ("admin", "safety", "dispatcher"),
     }
     CUSTOM_CREATE = {
         "worker": lambda a, d, l: _validate_worker(d),
@@ -233,15 +385,24 @@ class RuleEngine:
         "incident": lambda a, d, l: _validate_incident(d),
         "task": lambda a, d, l: _validate_task(d, l),
         "offline_record": lambda a, d, l: _validate_offline(d),
+        "evacuation_plan": lambda a, d, l: _validate_evacuation_plan(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("sensor", "raise_alarm"): _sensor_alarm,
         ("incident", "close"): _close_incident,
         ("task", "complete"): _complete_task,
+        ("evacuation_plan", "submit"): _submit_evacuation_plan,
+        ("worker", "shelter"): _worker_shelter,
     }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    def refuge_occupancy(self, lookup, exclude_plan_id=None):
+        return _refuge_occupancy(lookup, exclude_plan_id)
+
+    def compute_routes(self, lookup, workers, base_occupancy=None):
+        return compute_routes(lookup, workers, base_occupancy)
 
     def initial_status(self, kind, data=None):
         kind = self.normalize_kind(kind)

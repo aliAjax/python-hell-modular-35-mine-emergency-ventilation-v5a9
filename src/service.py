@@ -2,7 +2,7 @@ import hashlib
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .domain import Actor, ConflictError, NotFoundError, PermissionDenied, ValidationError
 from .rules import RuleEngine
 
 
@@ -57,7 +57,98 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        kind = self.rules.normalize_kind(entity["kind"])
+        if kind == "passage":
+            self._recompute_plans(entity_id)
+        elif kind == "worker" and action == "shelter":
+            self._confirm_arrival(entity_id, patch.get("refuge_id"))
         return updated
+
+    def _recompute_plans(self, passage_id):
+        """Invalidate routes through a changed passage and re-route affected workers."""
+        system = Actor("system", "admin")
+        for summary in self.repository.list_entities(kind="evacuation_plan", status="active"):
+            for _ in range(3):
+                plan = self.repository.get_entity(summary["id"])
+                kept, pending = [], []
+                for assignment in plan["data"].get("assignments", []):
+                    if assignment.get("status") == "arrived":
+                        kept.append(assignment)
+                    elif assignment.get("status") == "planned" and passage_id not in assignment.get("passage_ids", []):
+                        kept.append(assignment)
+                    else:
+                        pending.append(assignment)
+                if not pending:
+                    break
+                workers = []
+                for assignment in pending:
+                    worker = self.repository.get_entity(assignment["worker_id"])
+                    if worker and worker["status"] in ("active", "awaiting_rescue"):
+                        workers.append(worker)
+                    else:
+                        kept.append(assignment)
+                occupancy = self.rules.refuge_occupancy(self._lookup, exclude_plan_id=plan["id"])
+                for assignment in kept:
+                    refuge_id = assignment.get("refuge_id")
+                    if refuge_id:
+                        occupancy[refuge_id] = occupancy.get(refuge_id, 0) + 1
+                rerouted = self.rules.compute_routes(self._lookup, workers, occupancy)
+                by_worker = {worker["id"]: worker for worker in workers}
+                for assignment in rerouted:
+                    worker = by_worker[assignment["worker_id"]]
+                    if assignment["status"] == "planned" and worker["status"] == "awaiting_rescue":
+                        self.transition(system, worker["id"], "reroute", {"plan_id": plan["id"]})
+                    elif assignment["status"] == "unreachable" and worker["status"] == "active":
+                        self.transition(system, worker["id"], "mark_awaiting_rescue", {"plan_id": plan["id"]})
+                merged = dict(plan["data"])
+                merged["assignments"] = kept + rerouted
+                try:
+                    self.repository.update_entity(plan["id"], plan["version"], plan["status"], merged)
+                except ConflictError:
+                    continue
+                self.audit.record(
+                    plan["id"],
+                    system,
+                    "recompute",
+                    plan["status"],
+                    plan["status"],
+                    {"passage_id": passage_id, "reassigned": [a["worker_id"] for a in rerouted]},
+                )
+                break
+
+    def _confirm_arrival(self, worker_id, refuge_id):
+        """Mark the worker's planned assignment as arrived in the active plan."""
+        system = Actor("system", "admin")
+        for summary in self.repository.list_entities(kind="evacuation_plan", status="active"):
+            for _ in range(3):
+                plan = self.repository.get_entity(summary["id"])
+                assignments = plan["data"].get("assignments", [])
+                matched = False
+                for assignment in assignments:
+                    if (
+                        assignment.get("worker_id") == worker_id
+                        and assignment.get("status") == "planned"
+                        and assignment.get("refuge_id") == refuge_id
+                    ):
+                        assignment["status"] = "arrived"
+                        matched = True
+                if not matched:
+                    break
+                merged = dict(plan["data"])
+                merged["assignments"] = assignments
+                try:
+                    self.repository.update_entity(plan["id"], plan["version"], plan["status"], merged)
+                except ConflictError:
+                    continue
+                self.audit.record(
+                    plan["id"],
+                    system,
+                    "confirm_arrival",
+                    plan["status"],
+                    plan["status"],
+                    {"worker_id": worker_id, "refuge_id": refuge_id},
+                )
+                return
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""
